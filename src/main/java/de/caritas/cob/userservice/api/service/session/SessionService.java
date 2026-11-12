@@ -964,6 +964,7 @@ public class SessionService {
    * @param consultant the calling consultant
    * @return {@link ConsultantSessionDTO} entity for the specific session
    */
+  @Transactional(readOnly = true)
   public ConsultantSessionDTO fetchSessionForConsultant(
       @NonNull Long sessionId, @NonNull Consultant consultant) {
 
