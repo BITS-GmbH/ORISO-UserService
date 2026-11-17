@@ -9,6 +9,7 @@ import de.caritas.cob.userservice.api.model.Session;
 import de.caritas.cob.userservice.api.port.out.ConsultantRepository;
 import de.caritas.cob.userservice.api.port.out.SessionRepository;
 import de.caritas.cob.userservice.api.port.out.UserRepository;
+import de.caritas.cob.userservice.api.service.lifecycle.SessionInteractionService;
 import de.caritas.cob.userservice.api.service.mobilepushmessage.MobilePushNotificationService;
 import de.caritas.cob.userservice.api.service.notification.AdviceSeekerReplyEmailService;
 import de.caritas.cob.userservice.api.service.notification.EventNotificationService;
@@ -23,6 +24,7 @@ import io.micrometer.observation.Observation;
 import io.micrometer.observation.ObservationRegistry;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import lombok.NonNull;
@@ -59,6 +61,7 @@ public class MatrixEventListenerService {
   private LiveChatDiagnosticMetrics diagnosticMetrics;
   private ObservationRegistry observationRegistry = ObservationRegistry.NOOP;
   private TenantContextProvider tenantContextProvider;
+  private SessionInteractionService sessionInteractions;
 
   // Maps Matrix room ID to session ID for quick lookup
   private final Map<String, Long> roomToSessionMap = new ConcurrentHashMap<>();
@@ -95,6 +98,11 @@ public class MatrixEventListenerService {
   @Autowired(required = false)
   void setTenantContextProvider(TenantContextProvider tenantContextProvider) {
     this.tenantContextProvider = tenantContextProvider;
+  }
+
+  @Autowired(required = false)
+  void setSessionInteractions(SessionInteractionService sessionInteractions) {
+    this.sessionInteractions = sessionInteractions;
   }
 
   @Autowired(required = false)
@@ -598,6 +606,12 @@ public class MatrixEventListenerService {
       }
     }
 
+    // A counsellor interaction does not depend on who is notified or on the feed entry.
+    if (sessionId != null && senderDomainUserId != null) {
+      scheduleSessionInteraction(
+          senderId, senderDomainUserId, sessionId, interactionTime(event, msgtype, messageBody));
+    }
+
     // Get users who should receive notification (exclude sender)
     Set<String> userIds = getRecipientCandidatesForRoom(roomId);
     if (userIds == null || userIds.isEmpty()) {
@@ -667,6 +681,51 @@ public class MatrixEventListenerService {
                 }));
 
     return true;
+  }
+
+  /** Runs {@link #announceSessionInteraction} on the notification worker, off the sync loop. */
+  private void scheduleSessionInteraction(
+      String senderId, String senderDomainUserId, Long sessionId, Instant interactionAt) {
+    if (interactionAt == null || sessionInteractions == null) {
+      return;
+    }
+    try {
+      Runnable announce =
+          () ->
+              inTechnicalTenant(
+                  () ->
+                      announceSessionInteraction(
+                          senderId, senderDomainUserId, sessionId, interactionAt));
+      if (executorService == null) {
+        announce.run();
+      } else {
+        executorService.submit(announce);
+      }
+    } catch (Exception e) {
+      log.error("Failed to schedule the session interaction", e);
+    }
+  }
+
+  private void announceSessionInteraction(
+      String senderId, String senderDomainUserId, Long sessionId, Instant interactionAt) {
+    try {
+      if (isConsultantMatrixUser(senderId)) {
+        sessionInteractions.messageWritten(sessionId, senderDomainUserId, interactionAt);
+      }
+    } catch (Exception e) {
+      log.error("Failed to announce the session interaction", e);
+    }
+  }
+
+  /** A counsellor's own message counts as an interaction; notices and system messages do not. */
+  private static Instant interactionTime(
+      Map<String, Object> event, String msgtype, String messageBody) {
+    if ("m.notice".equals(msgtype)
+        || (messageBody != null && messageBody.startsWith("[SYSTEM_NOTIFICATION]"))
+        || !(event.get("origin_server_ts") instanceof Number timestamp)) {
+      return null;
+    }
+    return Instant.ofEpochMilli(timestamp.longValue());
   }
 
   private boolean isEligibleForReplyEmail(Map<String, Object> event) {
